@@ -1,0 +1,455 @@
+diff -uprN /mnt/hgfs/code/tmp/dnsmasq-2.80/Makefile /home/build/self/dnsmasq-2.80/Makefile
+--- /mnt/hgfs/code/tmp/dnsmasq-2.80/Makefile	2019-03-22 13:56:00.000000000 +0800
++++ /home/build/self/dnsmasq-2.80/Makefile	2018-10-19 02:21:55.000000000 +0800
+@@ -28,7 +28,7 @@ CFLAGS        = -Wall -W -O2
+ LDFLAGS       = 
+ COPTS         = 
+ RPM_OPT_FLAGS = 
+-LIBS          = -lsysrepo
++LIBS          = 
+ 
+ #################################################################
+ 
+@@ -43,12 +43,6 @@ XGETTEXT   = xgettext
+ SRC = src
+ PO  = po
+ MAN = man
+-YANG = yang
+-
+-# sysrepo datastore directories
+-
+-SYSREPO_DIR        = /etc/sysrepo/
+-SYSREPO_SCHEMA_DIR = $(SYSREPO_DIR)yang/
+ 
+ #################################################################
+ 
+@@ -111,7 +105,6 @@ install-common :
+ 	$(INSTALL) -d $(DESTDIR)$(MANDIR)/man8
+ 	$(INSTALL) -m 644 $(MAN)/dnsmasq.8 $(DESTDIR)$(MANDIR)/man8 
+ 	$(INSTALL) -m 755 $(BUILDDIR)/dnsmasq $(DESTDIR)$(BINDIR)
+-	$(INSTALL) -m 644 $(YANG)/*.yang $(SYSREPO_SCHEMA_DIR)
+ 
+ all-i18n : $(BUILDDIR)
+ 	@cd $(BUILDDIR) && $(MAKE) \
+diff -uprN /mnt/hgfs/code/tmp/dnsmasq-2.80/README.md /home/build/self/dnsmasq-2.80/README.md
+--- /mnt/hgfs/code/tmp/dnsmasq-2.80/README.md	2019-03-22 14:52:11.000000000 +0800
++++ /home/build/self/dnsmasq-2.80/README.md	1970-01-01 08:00:00.000000000 +0800
+@@ -1,37 +0,0 @@
+-[![YANG via sysrepo](https://img.shields.io/badge/YANG-via_sysrepo-blue.svg)](yang/sysrepo-dnsmasq%402016-01-22.yang)
+-# dnsmasq-sysrepo - NETCONF enabled dnsmasq fork
+-
+-Fork of dnsmasq that uses sysrepo to store its configuration, which makes it remotely manageble via NETCONF.
+-
+-The purpose of this project is to demonstrate how [sysrepo](https://github.com/sysrepo/sysrepo/blob/master/INSTALL.md) & [Netopeer 2](https://github.com/CESNET/Netopeer2) can be used to make an existing Linux application remotely manageable via NECTONF in a few hours. 
+-
+-## Integration
+-Only following features of dnsmasq have been integrated with sysrepo so far:
+-* username & groupname dnsmasq will run as,
+-* dns-server: enabling/disabling the server, configuring the port that DNS serevr is bound to,
+-* dhcp-server: enabling/disabling the server, configuring list of DHCP pools and their lease-time.
+-
+-See the [YANG model](yang/sysrepo-dnsmasq%402016-01-22.yang) or [full diff of the integration](https://github.com/sysrepo/dnsmasq-sysrepo/compare/a92c41eda58624056242f0c3a71c1efb7bba91b5...master) for more  information.
+-
+-## Demo
+-Asciinema-recored demo of this integration is available here: http://www.sysrepo.org/dnsmasq-demo
+-
+-## Installation
+-To use this integration, follow hese steps:
+-
+-1) [Install sysrepo](https://github.com/sysrepo/sysrepo/blob/master/INSTALL.md).
+-
+-2) Build & install dnsmasq (`make && make install`).
+-
+-3) Initialize dnsmasq YANG model in sysrepo:
+-```
+-sysrepoctl -i -g /etc/sysrepo/yang/sysrepo-dnsmasq\@2016-01-22.yang
+-```
+-
+-4) Import initial dnsmasq configuration into startup datastore:
+-```
+-sysrepocfg --import=yang/dnsmasq.xml --datastore=startup sysrepo-dnsmasq
+-```
+-
+-Note: Due to the limitiations of this integration, dnsmasq needs to be always running under root priviledges. The settings related to this are already part of the intial configuration imported in step 4).
+-
+diff -uprN /mnt/hgfs/code/tmp/dnsmasq-2.80/src/dnsmasq.c /home/build/self/dnsmasq-2.80/src/dnsmasq.c
+--- /mnt/hgfs/code/tmp/dnsmasq-2.80/src/dnsmasq.c	2019-03-22 14:00:49.000000000 +0800
++++ /home/build/self/dnsmasq-2.80/src/dnsmasq.c	2018-10-19 02:21:55.000000000 +0800
+@@ -18,7 +18,6 @@
+ #define DNSMASQ_COMPILE_OPTS
+ 
+ #include "dnsmasq.h"
+-#include <sysrepo.h>
+ 
+ struct daemon *daemon;
+ 
+@@ -33,175 +32,6 @@ static void fatal_event(struct event_des
+ static int read_event(int fd, struct event_desc *evp, char **msg);
+ static void poll_resolv(int force, int do_reload, time_t now);
+ 
+-/* initialize sysrepo connection & session */
+-static void sysrepo_init(sr_conn_ctx_t **connection, sr_session_ctx_t **session)
+-{
+-  int rc = SR_ERR_OK;
+-
+-  rc = sr_connect("dnsmasq", SR_CONN_DEFAULT, connection);
+-  if (SR_ERR_OK != rc) {
+-    fprintf(stderr, "Error: %s\n", sr_strerror(rc));
+-    return;
+-  }
+-
+-  /* normally bind to the STARTUP datastore, but in case that --load-running option was provided bind to RUNNING */
+-  rc = sr_session_start(*connection, (daemon->sysrepo_load_running ? SR_DS_RUNNING : SR_DS_STARTUP), SR_SESS_DEFAULT, session);
+-  if (SR_ERR_OK != rc) {
+-    sr_disconnect(*connection);
+-    fprintf(stderr, "Error: %s\n", sr_strerror(rc));
+-    return;
+-  }
+-}
+-
+-/* cleans up sysrepo connection & session */
+-static void sysrepo_cleanup(sr_conn_ctx_t *connection, sr_session_ctx_t *session, sr_subscription_ctx_t *subscription)
+-{
+-  sr_unsubscribe(session, subscription);
+-  sr_session_stop(session);
+-  sr_disconnect(connection);
+-}
+-
+-/* callback automatically callend whenever the configuration of dnsmasq YANG module has been changed in sysrepo */
+-static int sysrepo_config_change_cb(sr_session_ctx_t *session, const char *module_name, sr_notif_event_t event, void *private_ctx)
+-{
+-  (void)session;
+-  (void)event;
+-  (void)module_name;
+-  (void)private_ctx;
+-  char exe[1024] = { 0, };
+-  int ret = 0, i = 0;
+-
+-  printf("\n\n========== DNSMASQ CONFIG HAS CHANGED ==========\n\n");
+-
+-  /* since we don't see much into the dnsmasq implementation, we do a complete re-load of the process
+-   * instead of just re-initialization from the new configuration */
+-
+-  /* get the path to our executable */
+-  ret = readlink("/proc/self/exe", exe, sizeof(exe)-1);
+-  if(ret == -1) {
+-    fprintf(stderr, "Error: %s\n", strerror(errno));
+-    return SR_ERR_INTERNAL;
+-  }
+-  exe[ret] = 0;
+-
+-  /* close all file descriptors before exec */
+-  for (i = 0; i < sysconf(_SC_OPEN_MAX); i++) {
+-    if (i != STDOUT_FILENO && i != STDERR_FILENO && i != STDIN_FILENO) {
+-      close(i);
+-    }
+-  }
+-
+-  /* restart itself (note: dnsmasq must be running under root privileges, otherwise this fails) */
+-  if (option_bool(OPT_DEBUG)) {
+-    execl(exe, "dnsmasq", "-d", "--load-running", NULL);
+-  } else {
+-    execl(exe, "dnsmasq", "--load-running", NULL);
+-  }
+-  return SR_ERR_OK;
+-}
+-
+-/* subscribes for the changes in dnsmasq YANG module in sysrepo */
+-static void sysrepo_change_subscribe(sr_session_ctx_t *session, sr_subscription_ctx_t **subscription)
+-{
+-  int rc = SR_ERR_OK;
+-
+-  rc = sr_module_change_subscribe(session, "sysrepo-dnsmasq", sysrepo_config_change_cb, NULL, 0, SR_SUBSCR_DEFAULT, subscription);
+-  if (SR_ERR_OK != rc) {
+-    fprintf(stderr, "Error: %s\n", sr_strerror(rc));
+-  }
+-}
+-
+-/* read configuration of a DHCP pool */
+-void read_dhcp_pool_config(sr_session_ctx_t *session, const char *list_xpath)
+-{
+-  sr_val_t *values = NULL;
+-  size_t values_cnt = 0, i = 0;
+-  char req_xpath[PATH_MAX+1] = { 0, }, *name = NULL;
+-  int rc = SR_ERR_OK;
+-
+-  struct dhcp_context *dhcp = calloc(1, sizeof(struct dhcp_context));
+-  if (NULL == dhcp) {
+-      fprintf(stderr, "Error: %s\n", strerror(errno));
+-      return;
+-  }
+-  dhcp->lease_time = DEFLEASE;
+-
+-  strncat(req_xpath, list_xpath, PATH_MAX-3);
+-  strcat(req_xpath, "//*");
+-
+-  rc = sr_get_items(session, req_xpath, &values, &values_cnt);
+-  if (SR_ERR_OK == rc) {
+-    for (i = 0; i < values_cnt; i++) {
+-        name = strrchr(values[i].xpath, '/');
+-        if (0 == strcmp("/start-addr", name)) {
+-          inet_pton(AF_INET, values[i].data.string_val, &dhcp->start);
+-        }
+-        if (0 == strcmp("/end-addr", name)) {
+-          inet_pton(AF_INET, values[i].data.string_val, &dhcp->end);
+-        }
+-        if (0 == strcmp("/lease-time", name)) {
+-          dhcp->lease_time = values[i].data.uint32_val;
+-        }
+-    }
+-    sr_free_values(values, values_cnt);
+-
+-    dhcp->next = daemon->dhcp;
+-    daemon->dhcp = dhcp;
+-  } else {
+-    fprintf(stderr, "Error: %s\n", strerror(errno));
+-  }
+-}
+-
+-/* reads dnsmasq configuration from sysrepo */
+-void read_sysrepo_config(sr_session_ctx_t *session)
+-{
+-  sr_val_t *value = NULL, *values = NULL;
+-  size_t values_cnt = 0, i = 0;
+-  int rc = SR_ERR_OK;
+-
+-  rc = sr_get_item(session, "/sysrepo-dnsmasq:dnsmasq-cfg/username", &value);
+-  if (SR_ERR_OK == rc) {
+-    daemon->username = strdup(value->data.string_val);
+-    sr_free_val(value);
+-  }
+-
+-  rc = sr_get_item(session, "/sysrepo-dnsmasq:dnsmasq-cfg/groupname", &value);
+-  if (SR_ERR_OK == rc) {
+-    daemon->groupname = strdup(value->data.string_val);
+-    sr_free_val(value);
+-  }
+-
+-  rc = sr_get_item(session, "/sysrepo-dnsmasq:dnsmasq-cfg/dns-server/enabled", &value);
+-  if (SR_ERR_OK == rc) {
+-    sr_free_val(value);
+-
+-    /* dns server enabled, read its config */
+-    rc = sr_get_item(session, "/sysrepo-dnsmasq:dnsmasq-cfg/dns-server/port", &value);
+-    if (SR_ERR_OK == rc) {
+-      daemon->port = value->data.uint32_val;
+-      sr_free_val(value);
+-    }
+-  } else if (SR_ERR_NOT_FOUND == rc) {
+-    /* dns server disabled */
+-    daemon->port = 0;
+-  }
+-
+-  rc = sr_get_item(session, "/sysrepo-dnsmasq:dnsmasq-cfg/dhcp-server/enabled", &value);
+-  if (SR_ERR_OK == rc) {
+-    sr_free_val(value);
+-
+-    /* dhcp server enabled, read its config */
+-    rc = sr_get_items(session, "/sysrepo-dnsmasq:dnsmasq-cfg/dhcp-server/dhcp-pool", &values, &values_cnt);
+-    if (SR_ERR_OK == rc) {
+-      for (i = 0; i < values_cnt; i++) {
+-        read_dhcp_pool_config(session, values[i].xpath);
+-      }
+-      sr_free_values(values, values_cnt);
+-    }
+-  }
+-}
+-
+-
+ int main (int argc, char **argv)
+ {
+   int bind_fallback = 0;
+@@ -239,10 +69,6 @@ int main (int argc, char **argv)
+   textdomain("dnsmasq");
+ #endif
+ 
+-  sr_conn_ctx_t *connection = NULL;
+-  sr_session_ctx_t *session = NULL;
+-  sr_subscription_ctx_t *subscription = NULL;
+-
+   sigact.sa_handler = sig_handler;
+   sigact.sa_flags = 0;
+   sigemptyset(&sigact.sa_mask);
+@@ -263,10 +89,6 @@ int main (int argc, char **argv)
+   rand_init(); /* Must precede read_opts() */
+   
+   read_opts(argc, argv, compile_opts);
+-
+-	sysrepo_init(&connection, &session);
+-  read_sysrepo_config(session); /* read supported config from sysrepo datastore */
+-  sysrepo_cleanup(connection, session, subscription);
+  
+   if (daemon->edns_pktsz < PACKETSZ)
+     daemon->edns_pktsz = PACKETSZ;
+@@ -1113,9 +935,6 @@ int main (int argc, char **argv)
+   /* Using inotify, have to select a resolv file at startup */
+   poll_resolv(1, 0, now);
+ #endif
+-
+-  sysrepo_init(&connection, &session);
+-  sysrepo_change_subscribe(session, &subscription);
+   
+   while (1)
+     {
+@@ -1312,9 +1131,6 @@ int main (int argc, char **argv)
+ #endif
+ 
+     }
+-
+-	sysrepo_cleanup(connection, session, subscription);
+-    
+ }
+ 
+ static void sig_handler(int sig)
+diff -uprN /mnt/hgfs/code/tmp/dnsmasq-2.80/src/dnsmasq.h /home/build/self/dnsmasq-2.80/src/dnsmasq.h
+--- /mnt/hgfs/code/tmp/dnsmasq-2.80/src/dnsmasq.h	2019-03-22 14:01:51.000000000 +0800
++++ /home/build/self/dnsmasq-2.80/src/dnsmasq.h	2018-10-19 02:21:55.000000000 +0800
+@@ -1136,8 +1136,6 @@ extern struct daemon {
+   /* file for packet dumps. */
+   int dumpfd;
+ #endif
+-
+-	int sysrepo_load_running;
+ } *daemon;
+ 
+ /* cache.c */
+diff -uprN /mnt/hgfs/code/tmp/dnsmasq-2.80/src/option.c /home/build/self/dnsmasq-2.80/src/option.c
+--- /mnt/hgfs/code/tmp/dnsmasq-2.80/src/option.c	2019-03-22 14:03:32.000000000 +0800
++++ /home/build/self/dnsmasq-2.80/src/option.c	2018-10-19 02:21:55.000000000 +0800
+@@ -166,7 +166,6 @@ struct myoption {
+ #define LOPT_UBUS          354
+ #define LOPT_NAME_MATCH    355
+ #define LOPT_CAA           356
+-#define LOPT_LOAD_RUNNING  357
+  
+ #ifdef HAVE_GETOPT_LONG
+ static const struct option opts[] =  
+@@ -338,7 +337,6 @@ static const struct myoption opts[] =
+     { "dhcp-rapid-commit", 0, 0, LOPT_RAPID_COMMIT },
+     { "dumpfile", 1, 0, LOPT_DUMPFILE },
+     { "dumpmask", 1, 0, LOPT_DUMPMASK },
+-    { "load-running", 0, 0, LOPT_LOAD_RUNNING },
+     { NULL, 0, 0, 0 }
+   };
+ 
+@@ -4265,11 +4263,7 @@ err:
+ 	break;
+       }
+ #endif
+-
+-		case LOPT_LOAD_RUNNING:
+-        daemon->sysrepo_load_running = 1;
+-      break;
+-      
++		
+     default:
+       ret_err(_("unsupported option (check that dnsmasq was compiled with DHCP/TFTP/DNSSEC/DBus support)"));
+       
+diff -uprN /mnt/hgfs/code/tmp/dnsmasq-2.80/yang/dnsmasq.xml /home/build/self/dnsmasq-2.80/yang/dnsmasq.xml
+--- /mnt/hgfs/code/tmp/dnsmasq-2.80/yang/dnsmasq.xml	2019-03-22 14:04:10.000000000 +0800
++++ /home/build/self/dnsmasq-2.80/yang/dnsmasq.xml	1970-01-01 08:00:00.000000000 +0800
+@@ -1,10 +0,0 @@
+-<dnsmasq-cfg xmlns="urn:ietf:params:xml:ns:yang:dnsmasq">
+-  <username>root</username>
+-  <groupname>root</groupname>
+-  <dns-server>
+-    <enabled>true</enabled>
+-    <port>53</port>
+-  </dns-server>
+-</dnsmasq-cfg>
+-
+-
+diff -uprN /mnt/hgfs/code/tmp/dnsmasq-2.80/yang/sysrepo-dnsmasq@2016-01-22.yang /home/build/self/dnsmasq-2.80/yang/sysrepo-dnsmasq@2016-01-22.yang
+--- /mnt/hgfs/code/tmp/dnsmasq-2.80/yang/sysrepo-dnsmasq@2016-01-22.yang	2019-03-22 14:04:31.000000000 +0800
++++ /home/build/self/dnsmasq-2.80/yang/sysrepo-dnsmasq@2016-01-22.yang	1970-01-01 08:00:00.000000000 +0800
+@@ -1,90 +0,0 @@
+-module sysrepo-dnsmasq {
+-
+-  yang-version 1;
+-
+-  namespace "urn:ietf:params:xml:ns:yang:dnsmasq";
+-
+-  prefix srdns;
+-
+-  import ietf-inet-types {
+-    prefix inet;
+-  }
+-
+-  organization "sysrepo.org";
+-
+-  contact "sysrepo-devel@sysrepo.org";
+-
+-  description "Experimental dnsmasq tool YANG model.";
+-
+-  revision 2016-01-22 {
+-    description "Inital revision";
+-    reference "sysrepo.org";
+-  }
+-
+-  container dnsmasq-cfg {
+-    description "dnsmasq tool configuration.";
+-
+-    leaf username {
+-      type string;
+-      default "nobody";
+-      description "Specify the userid to which dnsmasq will change after startup. Dnsmasq must normally be started as root,
+-        but it will drop root privileges after startup by changing id to another user. Normally this user is 'nobody'
+-        but that can be over-ridden with this switch.";
+-    }
+-
+-    leaf groupname {
+-      type string;
+-      default "dip";
+-      description "Specify the group which dnsmasq will run as. The defaults to 'dip', if available, to facilitate access to 
+-        /etc/ppp/resolv.conf which is not normally world readable.";
+-    }
+-
+-    container dns-server {
+-      description "DNS server subsystem configuration.";
+-
+-      leaf enabled {
+-        type boolean;
+-        default true;
+-        description "Controls whether DNS server is enabled or disabled.";
+-      }
+-
+-      leaf port {
+-        type uint32;
+-        default 53;
+-        description "Port that DNS serevr is bound to.";
+-      }
+-    }
+-
+-    container dhcp-server {
+-      description "DHCP server subsystem configuration.";
+-
+-      leaf enabled {
+-        type boolean;
+-        default true;
+-        description "Controls whether DHCP server is enabled or disabled.";
+-      }
+-
+-      list dhcp-pool {
+-        key "start-addr end-addr";
+-        description "DHCP pool configuration. Addresses will be given out from the range start-addr to end-addr.";
+-
+-        leaf start-addr {
+-          type inet:ipv4-address-no-zone;
+-          description "First address of the DHCP pool.";
+-        }
+-
+-        leaf end-addr {
+-          type inet:ipv4-address-no-zone;
+-          description "Last address of the DHCP pool.";
+-        }
+-
+-        leaf lease-time {
+-          type uint32;
+-          default 3600;
+-          description "Time period for which the assigned IP address will be leased.";
+-        }
+-      }
+-    }
+-  }
+-}
+-
